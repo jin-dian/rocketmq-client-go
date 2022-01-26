@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	errors2 "github.com/apache/rocketmq-client-go/v2/errors"
 	"net"
 	"os"
 	"strconv"
@@ -55,7 +56,7 @@ const (
 )
 
 var (
-	ErrServiceState = errors.New("service close is not running, please check")
+	ErrServiceState = errors2.ErrService
 
 	_VIPChannelEnable = false
 )
@@ -88,6 +89,7 @@ type InnerConsumer interface {
 	GetcType() string
 	GetModel() string
 	GetWhere() string
+	ResetOffset(topic string, table map[primitive.MessageQueue]int64)
 }
 
 func DefaultClientOptions() ClientOptions {
@@ -185,6 +187,9 @@ func GetOrNewRocketMQClient(option ClientOptions, callbackCh chan interface{}) R
 		done:         make(chan struct{}),
 	}
 	actual, loaded := clientMap.LoadOrStore(client.ClientID(), client)
+	client.namesrvs = GetOrSetNamesrv(client.ClientID(), client.namesrvs)
+	client.namesrvs.bundleClient = actual.(*rmqClient)
+	client.option.Namesrv = client.namesrvs
 	if !loaded {
 		client.remoteClient.RegisterRequestFunc(ReqNotifyConsumerIdsChanged, func(req *remote.RemotingCommand, addr net.Addr) *remote.RemotingCommand {
 			rlog.Info("receive broker's notification to consumer group", map[string]interface{}{
@@ -282,6 +287,23 @@ func GetOrNewRocketMQClient(option ClientOptions, callbackCh chan interface{}) R
 				}
 			}
 			return res
+		})
+
+		client.remoteClient.RegisterRequestFunc(ReqResetConsumerOffset, func(req *remote.RemotingCommand, addr net.Addr) *remote.RemotingCommand {
+			rlog.Info("receive reset consumer offset request...", map[string]interface{}{
+				rlog.LogKeyBroker:        addr.String(),
+				rlog.LogKeyTopic:         req.ExtFields["topic"],
+				rlog.LogKeyConsumerGroup: req.ExtFields["group"],
+				rlog.LogKeyTimeStamp:     req.ExtFields["timestamp"],
+			})
+			header := new(ResetOffsetHeader)
+			header.Decode(req.ExtFields)
+
+			body := new(ResetOffsetBody)
+			body.Decode(req.Body)
+
+			client.resetOffset(header.topic, header.group, body.OffsetTable)
+			return nil
 		})
 	}
 	return actual.(*rmqClient)
@@ -448,7 +470,9 @@ func (c *rmqClient) InvokeSync(ctx context.Context, addr string, request *remote
 	if c.close {
 		return nil, ErrServiceState
 	}
-	ctx, _ = context.WithTimeout(ctx, timeoutMillis)
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithTimeout(ctx, timeoutMillis)
+	defer cancel()
 	return c.remoteClient.InvokeSync(ctx, addr, request)
 }
 
@@ -524,14 +548,16 @@ func (c *rmqClient) SendHeartbeatToAllBrokerWithLock() {
 			}
 			cmd := remote.NewRemotingCommand(ReqHeartBeat, nil, hbData.encode())
 
-			ctx, _ := context.WithTimeout(context.Background(), 3*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			response, err := c.remoteClient.InvokeSync(ctx, addr, cmd)
 			if err != nil {
+				cancel()
 				rlog.Warning("send heart beat to broker error", map[string]interface{}{
 					rlog.LogKeyUnderlayError: err,
 				})
 				return true
 			}
+			cancel()
 			if response.Code == ResSuccess {
 				c.namesrvs.AddBrokerVersion(brokerName, addr, int32(response.Version))
 				rlog.Debug("send heart beat to broker success", map[string]interface{}{
@@ -633,7 +659,9 @@ func (c *rmqClient) ProcessSendResponse(brokerName string, cmd *remote.RemotingC
 // PullMessage with sync
 func (c *rmqClient) PullMessage(ctx context.Context, brokerAddrs string, request *PullMessageRequestHeader) (*primitive.PullResult, error) {
 	cmd := remote.NewRemotingCommand(ReqPullMessage, request, nil)
-	ctx, _ = context.WithTimeout(ctx, 30*time.Second)
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	res, err := c.remoteClient.InvokeSync(ctx, brokerAddrs, cmd)
 	if err != nil {
 		return nil, err
@@ -769,6 +797,15 @@ func (c *rmqClient) isNeedUpdateSubscribeInfo(topic string) bool {
 		return true
 	})
 	return result
+}
+
+func (c *rmqClient) resetOffset(topic string, group string, offsetTable map[primitive.MessageQueue]int64) {
+	consumer, exist := c.consumerMap.Load(group)
+	if !exist {
+		rlog.Warning("group "+group+" do not exists", nil)
+		return
+	}
+	consumer.(InnerConsumer).ResetOffset(topic, offsetTable)
 }
 
 func (c *rmqClient) getConsumerRunningInfo(group string) *ConsumerRunningInfo {
